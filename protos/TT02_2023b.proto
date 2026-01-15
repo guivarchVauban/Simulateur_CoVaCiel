@@ -191,6 +191,12 @@ PROTO TT02_2023b [
           ]
         }
       }
+      GPS {
+        name "gps"
+      }
+      InertialUnit {
+        name "imu"
+      }
       Transform {
         translation 0.127 0 -0.02
         rotation 0 0 1 0

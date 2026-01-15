@@ -1,5 +1,5 @@
 from vehicle import Driver
-from controller import Lidar
+from controller import Lidar, GPS, InertialUnit
 import rclpy
 from rclpy.node import Node
 from geometry_msgs.msg import Twist
@@ -11,6 +11,8 @@ import numpy as np
 import math
 from tf2_ros import TransformBroadcaster
 from geometry_msgs.msg import TransformStamped
+ 
+
 
 # --- Webots Driver ---
 driver = Driver()
@@ -20,6 +22,12 @@ sensorTimeStep = 4 * basicTimeStep
 # --- Lidar ---
 lidar = Lidar("RpLidarA2")
 lidar.enable(sensorTimeStep)
+
+gps = GPS("gps")
+gps.enable(sensorTimeStep)
+
+imu = InertialUnit("imu")
+imu.enable(sensorTimeStep)
 
 # --- Limits ---
 MAX_SPEED_KMH = 28
@@ -44,21 +52,21 @@ class TT02Ros(Node):
         self.theta = 0.0
         self.last_time = self.get_clock().now().nanoseconds * 1e-9
 
-    def publish_odom(self):
-        current_time = self.get_clock().now()
-        dt = (current_time.nanoseconds * 1e-9) - self.last_time
-        self.last_time = current_time.nanoseconds * 1e-9
+        # Timer to publish TF continuously
+        # self.tf_timer = self.create_timer(0.1, self.publish_tf)
 
-        # Integrate position
-        delta_x = self.v * math.cos(self.theta) * dt
-        delta_y = self.v * math.sin(self.theta) * dt
-        delta_theta = self.w * dt
+    def publish_odom(self, current_time):
+    # Pose vraie Webots
+        p = gps.getValues()  # [x, y, z] dans repère Webots
+        rpy = imu.getRollPitchYaw()
+        yaw = rpy[2]
 
-        self.x += delta_x
-        self.y += delta_y
-        self.theta += delta_theta
+        # ⚠️ Convention : Webots est souvent X avant, Z haut, Y gauche/droite.
+        # Selon ton monde, tu devras peut-être mapper (x,y) -> (x, y) ou (x, -y)
+        x = float(p[0])
+        y = float(p[1])   # parfois il faut mettre -p[2] ou -p[1] selon ton modèle
+        self.x, self.y, self.theta = x, y, yaw
 
-        # Create odom message
         odom = Odometry()
         odom.header.stamp = current_time.to_msg()
         odom.header.frame_id = "odom"
@@ -70,22 +78,76 @@ class TT02Ros(Node):
         odom.pose.pose.orientation.z = math.sin(self.theta / 2.0)
         odom.pose.pose.orientation.w = math.cos(self.theta / 2.0)
 
-        odom.twist.twist.linear.x = self.v
-        odom.twist.twist.angular.z = self.w
-
         self.odom_pub.publish(odom)
 
-        # Publish TF
-        t = TransformStamped()
-        t.header.stamp = current_time.to_msg()
-        t.header.frame_id = "odom"
-        t.child_frame_id = "base_link"
-        t.transform.translation.x = self.x
-        t.transform.translation.y = self.y
-        t.transform.translation.z = 0.0
-        t.transform.rotation.z = math.sin(self.theta / 2.0)
-        t.transform.rotation.w = math.cos(self.theta / 2.0)
-        self.tf_broadcaster.sendTransform(t)
+
+        # TF is published by timer
+
+    def publish_tf(self, current_time):
+            # ----------------------------
+        # 1) odom -> base_footprint
+        # ----------------------------
+        t_odom_fp = TransformStamped()
+        t_odom_fp.header.stamp = current_time.to_msg()
+        t_odom_fp.header.frame_id = "odom"
+        t_odom_fp.child_frame_id = "base_footprint"
+
+        t_odom_fp.transform.translation.x = float(self.x)
+        t_odom_fp.transform.translation.y = float(self.y)
+        t_odom_fp.transform.translation.z = 0.0
+
+        # yaw only
+        t_odom_fp.transform.rotation.x = 0.0
+        t_odom_fp.transform.rotation.y = 0.0
+        t_odom_fp.transform.rotation.z = math.sin(self.theta / 2.0)
+        t_odom_fp.transform.rotation.w = math.cos(self.theta / 2.0)
+
+        self.tf_broadcaster.sendTransform(t_odom_fp)
+
+        # ----------------------------
+        # 2) base_footprint -> base_link
+        # (identité 2D, ou mets ici z si ton base_link est surélevé)
+        # ----------------------------
+        t_fp_bl = TransformStamped()
+        t_fp_bl.header.stamp = current_time.to_msg()
+        t_fp_bl.header.frame_id = "base_footprint"
+        t_fp_bl.child_frame_id = "base_link"
+
+        t_fp_bl.transform.translation.x = 0.0
+        t_fp_bl.transform.translation.y = 0.0
+        t_fp_bl.transform.translation.z = 0.0  # ex: 0.05 si base_link est 5 cm au-dessus du sol
+
+        t_fp_bl.transform.rotation.x = 0.0
+        t_fp_bl.transform.rotation.y = 0.0
+        t_fp_bl.transform.rotation.z = 0.0
+        t_fp_bl.transform.rotation.w = 1.0
+
+        self.tf_broadcaster.sendTransform(t_fp_bl)
+
+        # ----------------------------
+        # 3) base_link -> lidar_link
+        # (offset du lidar si tu veux)
+        # ----------------------------
+        t_bl_lidar = TransformStamped()
+        t_bl_lidar.header.stamp = current_time.to_msg()
+        t_bl_lidar.header.frame_id = "base_link"
+        t_bl_lidar.child_frame_id = "lidar_link"
+
+        # Mets ici la vraie position du lidar par rapport à base_link
+        t_bl_lidar.transform.translation.x = 0.0   # ex: 0.10 si le lidar est 10 cm devant
+        t_bl_lidar.transform.translation.y = 0.0
+        t_bl_lidar.transform.translation.z = 0.0   # ex: 0.20 si le lidar est à 20 cm de hauteur
+
+        t_bl_lidar.transform.rotation.x = 0.0
+        t_bl_lidar.transform.rotation.y = 0.0
+        t_bl_lidar.transform.rotation.z = 0.0
+        t_bl_lidar.transform.rotation.w = 1.0
+
+        self.tf_broadcaster.sendTransform(t_bl_lidar)
+    def cmd_vel_cb(self, msg): # callback pour cmd_vel
+        self.v = msg.linear.x
+        self.w = msg.angular.z
+
 rclpy.init()
 node = TT02Ros()
 
@@ -106,20 +168,23 @@ def set_direction_rad(w, v):
 
 print("TT02 ROS controller started")
 step_count = 0
-SPIN_EVERY_N_STEPS = 6  
+SPIN_EVERY_N_STEPS = 1  
 while driver.step() != -1:
     step_count += 1
     if step_count % SPIN_EVERY_N_STEPS == 0:
         rclpy.spin_once(node, timeout_sec=0.0)
-        node.publish_odom()
-        now = node.get_clock().now().nanoseconds * 1e-9
+        current_time = node.get_clock().now()
+        node.publish_odom(current_time)
+        node.publish_tf(current_time)
+        
+        now = current_time.nanoseconds * 1e-9
         if now - node.last_scan_time >= node.scan_period:
             node.last_scan_time = now
 
             ranges = lidar.getRangeImage()  # liste de distances
 
             msg = LaserScan()
-            msg.header.stamp = node.get_clock().now().to_msg()
+            msg.header.stamp = current_time.to_msg()
             msg.header.frame_id = node.frame_id
 
             # Paramètres géométriques lidar depuis Webots
