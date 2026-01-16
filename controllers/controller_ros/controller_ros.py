@@ -13,6 +13,7 @@ from tf2_ros import TransformBroadcaster
 from geometry_msgs.msg import TransformStamped
  
 
+print("=== TT02 CONTROLLER STARTED ===", flush=True)
 
 # --- Webots Driver ---
 driver = Driver()
@@ -20,14 +21,19 @@ basicTimeStep = int(driver.getBasicTimeStep())
 sensorTimeStep = 4 * basicTimeStep
 
 # --- Lidar ---
-lidar = Lidar("RpLidarA2")
+lidar = driver.getDevice("RpLidarA2")
+gps = driver.getDevice("gps")
+#imu = driver.getDevice("imu")
+
+assert lidar is not None, "Lidar device not found"
+assert gps is not None, "GPS device not found"
+#assert imu is not None, "IMU device not found"
+
 lidar.enable(sensorTimeStep)
-
-gps = GPS("gps")
 gps.enable(sensorTimeStep)
+#imu.enable(sensorTimeStep)
 
-imu = InertialUnit("imu")
-imu.enable(sensorTimeStep)
+
 
 # --- Limits ---
 MAX_SPEED_KMH = 28
@@ -51,35 +57,102 @@ class TT02Ros(Node):
         self.y = 0.0
         self.theta = 0.0
         self.last_time = self.get_clock().now().nanoseconds * 1e-9
+        self.origin_set = False
+        self.x0 = 0.0
+        self.y0 = 0.0
+        self.yaw0 = 0.0
+        self.prev_x = None
+        self.prev_y = None
+
 
         # Timer to publish TF continuously
         # self.tf_timer = self.create_timer(0.1, self.publish_tf)
 
+    def normalize_angle(self, a: float) -> float:
+        while a > math.pi:
+            a -= 2.0 * math.pi
+        while a < -math.pi:
+            a += 2.0 * math.pi
+        return a
+
+
     def publish_odom(self, current_time):
-    # Pose vraie Webots
-        p = gps.getValues()  # [x, y, z] dans repère Webots
-        rpy = imu.getRollPitchYaw()
-        yaw = rpy[2]
+        """
+        POC odom from Webots GPS only:
+        - Use GPS X/Z as ROS x/y (ground plane)
+        - Initialize a local origin at first valid GPS sample
+        - Estimate yaw from displacement (atan2(dy, dx)) because car can't spin in place
+        - Publish /odom (TF should use self.x,self.y,self.theta)
+        """
 
-        # ⚠️ Convention : Webots est souvent X avant, Z haut, Y gauche/droite.
-        # Selon ton monde, tu devras peut-être mapper (x,y) -> (x, y) ou (x, -y)
-        x = float(p[0])
-        y = float(p[1])   # parfois il faut mettre -p[2] ou -p[1] selon ton modèle
-        self.x, self.y, self.theta = x, y, yaw
+        p = gps.getValues()  # [x, y, z] in Webots world frame
 
+        if p is None or len(p) < 3:
+            return
+
+        # Webots world -> ROS 2D
+        # IMPORTANT: ground plane in Webots is typically X-Z.
+        x_w = float(p[0])      # Webots X
+        y_w = float(p[2])      # Webots Z  -> ROS Y
+        # If you notice left/right mirrored, switch to: y_w = -float(p[2])
+
+        # Wait until GPS is valid (Webots returns NaN for a few ticks)
+        if not (math.isfinite(x_w) and math.isfinite(y_w)):
+            return
+
+        # Set local origin once
+        if not getattr(self, "origin_set", False):
+            self.x0 = x_w
+            self.y0 = y_w
+            self.origin_set = True
+
+            # init previous point for yaw estimation
+            self.prev_x = 0.0
+            self.prev_y = 0.0
+
+            # start at zero
+            self.x = 0.0
+            self.y = 0.0
+            self.theta = 0.0
+            # You can publish immediately, but returning avoids any first-step jump
+            # return
+
+        # Relative pose in odom
+        x = x_w - self.x0
+        y = y_w - self.y0
+
+        # Estimate yaw from motion (works well for cars)
+        dx = x - getattr(self, "prev_x", x)
+        dy = y - getattr(self, "prev_y", y)
+
+        if math.isfinite(dx) and math.isfinite(dy) and (dx * dx + dy * dy) > 1e-4:
+            # moved more than 1 cm -> update yaw
+            yaw = math.atan2(dy, dx)
+            self.theta = self.normalize_angle(yaw)
+
+        # Update stored pose
+        self.x = x
+        self.y = y
+        self.prev_x = x
+        self.prev_y = y
+
+        # Publish Odometry
         odom = Odometry()
         odom.header.stamp = current_time.to_msg()
         odom.header.frame_id = "odom"
-        odom.child_frame_id = "base_link"
+        odom.child_frame_id = "base_footprint"
 
-        odom.pose.pose.position.x = self.x
-        odom.pose.pose.position.y = self.y
+        odom.pose.pose.position.x = float(self.x)
+        odom.pose.pose.position.y = float(self.y)
         odom.pose.pose.position.z = 0.0
+
+        odom.pose.pose.orientation.x = 0.0
+        odom.pose.pose.orientation.y = 0.0
         odom.pose.pose.orientation.z = math.sin(self.theta / 2.0)
         odom.pose.pose.orientation.w = math.cos(self.theta / 2.0)
 
+        # Twist left unset (or you can derive it from dx/dy over dt if you want)
         self.odom_pub.publish(odom)
-
 
         # TF is published by timer
 
@@ -134,9 +207,9 @@ class TT02Ros(Node):
         t_bl_lidar.child_frame_id = "lidar_link"
 
         # Mets ici la vraie position du lidar par rapport à base_link
-        t_bl_lidar.transform.translation.x = 0.0   # ex: 0.10 si le lidar est 10 cm devant
+        t_bl_lidar.transform.translation.x = 0.2   # ex: 0.10 si le lidar est 10 cm devant
         t_bl_lidar.transform.translation.y = 0.0
-        t_bl_lidar.transform.translation.z = 0.0   # ex: 0.20 si le lidar est à 20 cm de hauteur
+        t_bl_lidar.transform.translation.z = 0.079   # ex: 0.20 si le lidar est à 20 cm de hauteur
 
         t_bl_lidar.transform.rotation.x = 0.0
         t_bl_lidar.transform.rotation.y = 0.0
@@ -144,6 +217,8 @@ class TT02Ros(Node):
         t_bl_lidar.transform.rotation.w = 1.0
 
         self.tf_broadcaster.sendTransform(t_bl_lidar)
+    
+    
     def cmd_vel_cb(self, msg): # callback pour cmd_vel
         self.v = msg.linear.x
         self.w = msg.angular.z
@@ -166,11 +241,13 @@ def set_direction_rad(w, v):
                 min(math.radians(MAX_STEER_DEG), angle))
     driver.setSteeringAngle(angle)
 
-print("TT02 ROS controller started")
+print("Controller ready, entering main loop.", flush=True)
 step_count = 0
 SPIN_EVERY_N_STEPS = 1  
 while driver.step() != -1:
     step_count += 1
+    print("GPS:", gps.getValues(), flush=True)
+
     if step_count % SPIN_EVERY_N_STEPS == 0:
         rclpy.spin_once(node, timeout_sec=0.0)
         current_time = node.get_clock().now()
@@ -181,37 +258,50 @@ while driver.step() != -1:
         if now - node.last_scan_time >= node.scan_period:
             node.last_scan_time = now
 
-            ranges = lidar.getRangeImage()  # liste de distances
+            ranges = lidar.getRangeImage()
+            n = len(ranges)
 
             msg = LaserScan()
             msg.header.stamp = current_time.to_msg()
             msg.header.frame_id = node.frame_id
 
-            # Paramètres géométriques lidar depuis Webots
-            msg.angle_min = -lidar.getFov() / 2.0
-            msg.angle_max =  lidar.getFov() / 2.0
-            msg.angle_increment = lidar.getFov() / max(1, (lidar.getHorizontalResolution() - 1))
+            # Important: remplir d'abord ces champs
+            msg.range_min = float(lidar.getMinRange())
+            msg.range_max = float(lidar.getMaxRange())
 
+            msg.scan_time = float(node.scan_period)
             msg.time_increment = 0.0
-            msg.scan_time = node.scan_period
 
-            msg.range_min = lidar.getMinRange()
-            msg.range_max = lidar.getMaxRange()
+            # Angles robustes (si tu veux forcer 360°)
+            msg.angle_min = -math.pi
+            msg.angle_max =  math.pi
+            msg.angle_increment = (msg.angle_max - msg.angle_min) / max(1, (n - 1))
 
-            # Webots renvoie parfois inf ou des valeurs hors range, on nettoie
+            # Nettoyage ranges
             cleaned = []
             for r in ranges:
-                if r is None:
+                if r is None or not math.isfinite(r):
                     cleaned.append(float("inf"))
                 elif r < msg.range_min or r > msg.range_max:
                     cleaned.append(float("inf"))
                 else:
                     cleaned.append(float(r))
 
+            # 1) Inverser sens si nécessaire
+            cleaned = cleaned[::-1]
+
+            # 2) (Optionnel) Rotation pour aligner "avant"
+            finite = [(i, r) for i, r in enumerate(cleaned) if math.isfinite(r)]
+            if finite:
+                i_min, r_min = min(finite, key=lambda x: x[1])
+                offset = (n // 2) - i_min
+                cleaned = cleaned[offset:] + cleaned[:offset]
+
             msg.ranges = cleaned
-            msg.intensities = []  # pas dispo par défaut
+            msg.intensities = []
 
             node.scan_pub.publish(msg)
+
 
 
     set_vitesse_m_s(node.v)
