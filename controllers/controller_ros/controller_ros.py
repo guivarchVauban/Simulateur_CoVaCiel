@@ -23,21 +23,21 @@ sensorTimeStep = 4 * basicTimeStep
 # --- Lidar ---
 lidar = driver.getDevice("RpLidarA2")
 gps = driver.getDevice("gps")
-#imu = driver.getDevice("imu")
+imu = driver.getDevice("imu")
 
 assert lidar is not None, "Lidar device not found"
 assert gps is not None, "GPS device not found"
-#assert imu is not None, "IMU device not found"
+assert imu is not None, "IMU device not found"
 
 lidar.enable(sensorTimeStep)
 gps.enable(sensorTimeStep)
-#imu.enable(sensorTimeStep)
+imu.enable(sensorTimeStep)
 
 
 
 # --- Limits ---
 MAX_SPEED_KMH = 28
-MAX_STEER_DEG = 32
+MAX_STEER_DEG = 65
 
 # --- ROS Node ---
 class TT02Ros(Node):
@@ -81,7 +81,7 @@ class TT02Ros(Node):
         POC odom from Webots GPS only:
         - Use GPS X/Z as ROS x/y (ground plane)
         - Initialize a local origin at first valid GPS sample
-        - Estimate yaw from displacement (atan2(dy, dx)) because car can't spin in place
+        - Use IMU for yaw
         - Publish /odom (TF should use self.x,self.y,self.theta)
         """
 
@@ -91,11 +91,13 @@ class TT02Ros(Node):
             return
 
         # Webots world -> ROS 2D
-        # IMPORTANT: ground plane in Webots is typically X-Z.
-        x_w = float(p[0])      # Webots X
-        y_w = float(p[2])      # Webots Z  -> ROS Y
-        # If you notice left/right mirrored, switch to: y_w = -float(p[2])
+        # IMPORTANT: ground plane in Webots is X-Y, with Z up.
+        x_w = float(p[0])      # Webots X -> ROS X (forward)
+        y_w = float(p[1])      # Webots Y -> ROS Y
+        z_wb = float(p[2])    # Webots Z (up)
 
+        
+        
         # Wait until GPS is valid (Webots returns NaN for a few ticks)
         if not (math.isfinite(x_w) and math.isfinite(y_w)):
             return
@@ -104,6 +106,9 @@ class TT02Ros(Node):
         if not getattr(self, "origin_set", False):
             self.x0 = x_w
             self.y0 = y_w
+            imu_values = imu.getRollPitchYaw()
+            if imu_values is not None and len(imu_values) >= 3:
+                self.yaw0 = float(imu_values[2])
             self.origin_set = True
 
             # init previous point for yaw estimation
@@ -121,14 +126,23 @@ class TT02Ros(Node):
         x = x_w - self.x0
         y = y_w - self.y0
 
-        # Estimate yaw from motion (works well for cars)
-        dx = x - getattr(self, "prev_x", x)
-        dy = y - getattr(self, "prev_y", y)
+        # Get yaw from IMU
+        imu_values = imu.getRollPitchYaw()
+        if imu_values is not None and len(imu_values) >= 3:
+            yaw = float(imu_values[2])
+            new_theta = self.normalize_angle(yaw - self.yaw0)
+            # Log si changement brusque
+            if hasattr(self, 'prev_theta') and abs(new_theta - self.prev_theta) > 0.1:
+                print(f"Theta jump: {self.prev_theta:.3f} -> {new_theta:.3f}", flush=True)
+            self.theta = new_theta
+            self.prev_theta = self.theta
 
-        if math.isfinite(dx) and math.isfinite(dy) and (dx * dx + dy * dy) > 1e-4:
-            # moved more than 1 cm -> update yaw
-            yaw = math.atan2(dy, dx)
-            self.theta = self.normalize_angle(yaw)
+            # Filtre exponentiel pour stabiliser theta
+            if not hasattr(self, 'prev_theta'):
+                self.prev_theta = new_theta
+            alpha = 0.9  # Ajustez entre 0.8-0.95 pour plus/moins de lissage
+            self.theta = alpha * self.prev_theta + (1 - alpha) * new_theta
+            self.prev_theta = self.theta
 
         # Update stored pose
         self.x = x
@@ -211,10 +225,11 @@ class TT02Ros(Node):
         t_bl_lidar.transform.translation.y = 0.0
         t_bl_lidar.transform.translation.z = 0.079   # ex: 0.20 si le lidar est à 20 cm de hauteur
 
+        # Rotation 180° autour de Z pour retourner l'orientation (avant derrière)
         t_bl_lidar.transform.rotation.x = 0.0
         t_bl_lidar.transform.rotation.y = 0.0
-        t_bl_lidar.transform.rotation.z = 0.0
-        t_bl_lidar.transform.rotation.w = 1.0
+        t_bl_lidar.transform.rotation.z = 1.0
+        t_bl_lidar.transform.rotation.w = 0.0
 
         self.tf_broadcaster.sendTransform(t_bl_lidar)
     
@@ -235,7 +250,8 @@ def set_direction_rad(w, v):
     if abs(v) < 0.01:
         angle = 0.0
     else:
-        angle = math.atan(w * 0.25 / v)
+        # Pour rendre intuitif : w > 0 braque à gauche, indépendamment de la direction
+        angle = math.atan(w * 0.25 / abs(v))
 
     angle = max(-math.radians(MAX_STEER_DEG),
                 min(math.radians(MAX_STEER_DEG), angle))
@@ -246,7 +262,7 @@ step_count = 0
 SPIN_EVERY_N_STEPS = 1  
 while driver.step() != -1:
     step_count += 1
-    print("GPS:", gps.getValues(), flush=True)
+    print("GPS:", gps.getValues(), "IMU:", imu.getRollPitchYaw(), flush=True)
 
     if step_count % SPIN_EVERY_N_STEPS == 0:
         rclpy.spin_once(node, timeout_sec=0.0)
@@ -287,22 +303,17 @@ while driver.step() != -1:
                 else:
                     cleaned.append(float(r))
 
-            # 1) Inverser sens si nécessaire
+            # Inverser le sens pour corriger l'orientation
             cleaned = cleaned[::-1]
-
-            # 2) (Optionnel) Rotation pour aligner "avant"
-            finite = [(i, r) for i, r in enumerate(cleaned) if math.isfinite(r)]
-            if finite:
-                i_min, r_min = min(finite, key=lambda x: x[1])
-                offset = (n // 2) - i_min
-                cleaned = cleaned[offset:] + cleaned[:offset]
 
             msg.ranges = cleaned
             msg.intensities = []
 
             node.scan_pub.publish(msg)
 
-
+    print(f"CMD_VEL: v={node.v}, w={node.w}", flush=True)
+    print("GPS:", gps.getValues(), flush=True)
+    print("IMU:", imu.getRollPitchYaw(), flush=True)
 
     set_vitesse_m_s(node.v)
     set_direction_rad(node.w, node.v)
